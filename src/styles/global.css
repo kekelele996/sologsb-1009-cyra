@@ -146,6 +146,57 @@ sl-textarea::part(textarea) { line-height: 1.65; }
 .issue-list button.error > span { color: #a72f27; } .issue-list button.info > span { color: #246996; }
 .issue-list button b { font-size: 10px; }
 .issue-list button small { color: #74807a; font-size: 9px; line-height: 1.4; }
+
+.acceptance-panel .issue-list { max-height: 460px; }
+.acceptance-summary { display: grid; gap: 3px; margin-bottom: 8px; padding: 8px 9px; border-radius: 8px; background: #f4f7f5; font-size: 9px; }
+.acceptance-summary span { font-weight: 700; }
+.acceptance-summary .error { color: #a72f27; } .acceptance-summary .warning { color: #9a6115; } .acceptance-summary .info { color: #246996; }
+.issue-filter { margin-bottom: 8px; }
+.issue-filter button { flex: 1; }
+.issue-entry { border: 1px solid #e0e4e2; border-left: 3px solid #d68b20; border-radius: 8px; background: #fff; overflow: hidden; }
+.issue-entry.error { border-left-color: var(--red); }
+.issue-entry.info { border-left-color: var(--blue); }
+.issue-entry.resolved { border-left-color: var(--green); opacity: .92; }
+.issue-entry.waived { border-left-color: #7c847f; opacity: .92; }
+.issue-entry.active { border-color: #9fc5b3; box-shadow: 0 0 0 2px #d5e8de; }
+.issue-head { width: 100%; display: grid; grid-template-columns: 1fr; gap: 2px; text-align: left; border: 0; background: transparent; padding: 8px 9px; cursor: pointer; }
+.issue-head > span { color: #9a6115; font-size: 8px; font-weight: 800; text-transform: uppercase; }
+.issue-entry.error .issue-head > span { color: #a72f27; } .issue-entry.info .issue-head > span { color: #246996; }
+.issue-head b { font-size: 10px; }
+.issue-head small { color: #74807a; font-size: 9px; line-height: 1.4; }
+.issue-head .accept-badge { justify-self: start; margin-top: 3px; }
+.issue-entry-body { border-top: 1px solid #eef1ef; padding: 8px 9px; background: #fafbfa; }
+
+.acceptance-box { border-radius: 8px; padding: 8px; display: grid; gap: 6px; }
+.acceptance-box.open { border: 1px dashed #d8c8a6; background: #fffdf6; }
+.acceptance-box.resolved { border: 1px solid #c4e0d0; background: #f1f9f4; }
+.acceptance-box.waived { border: 1px solid #d7dcd8; background: #f5f7f5; }
+.acceptance-box sl-input, .acceptance-box sl-textarea { margin: 0; }
+.acceptance-assignee { display: grid; grid-template-columns: 44px 1fr; gap: 6px; align-items: center; }
+.acceptance-assignee label { color: #61706a; font-size: 9px; font-weight: 700; }
+.acceptance-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.blocked-hint { color: #8a948e; font-size: 8px; }
+.acceptance-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; font-size: 9px; color: #5f6c66; }
+.acceptance-meta b { color: #2c7255; font-size: 10px; }
+.acceptance-box.waived .acceptance-meta b { color: #67746e; }
+.acceptance-note { margin: 0; font-size: 10px; line-height: 1.55; color: #3b4943; }
+.reopen-hint { margin: 0; padding: 5px 7px; border-radius: 6px; background: #fdeede; color: #93570a; font-size: 9px; font-weight: 700; }
+.issue-card .acceptance-box { margin-top: 8px; }
+.issue-card .accept-badge { margin-left: auto; }
+[data-invalid]::part(base), [data-invalid="true"]::part(base) { border-color: var(--red) !important; box-shadow: 0 0 0 2px rgba(185,54,45,.18); }
+.issue-counts .done-count { color: #2c7255; background: #e7f4ec; }
+
+.export-blocker { display: grid; gap: 10px; font-size: 12px; color: #3a4842; }
+.export-blocker p { margin: 0; }
+.export-blocker ul { margin: 0; padding-left: 18px; display: grid; gap: 5px; }
+.export-blocker li.error { color: #a72f27; font-weight: 700; }
+.export-blocker li.warning { color: #93570a; font-weight: 700; }
+.export-blocker li.info { color: #246996; }
+.blocker-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.blocker-jump { border: 1px solid #ecc7c3; background: #fdf3f2; color: #a72f27; border-radius: 99px; padding: 4px 10px; font-size: 10px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+.blocker-jump small { color: #98a09b; }
+.blocker-ok { margin: 0; padding: 8px 10px; border-radius: 8px; background: #f2f9f5; color: #2c7255; font-size: 10px; line-height: 1.5; }
+
 .version-diff { display: grid; gap: 7px; margin-top: 8px; }
 .diff-column { border-left: 3px solid #c58124; background: #fffaf1; border-radius: 6px; padding: 7px 8px; }
 .diff-column.current { border-left-color: #34795d; background: #f2f9f5; }

@@ -57,17 +57,34 @@ interface ChapterProject {
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
+  issueAcceptance: Record<string, IssueAcceptance>;
   updatedAt: string;
 }
 
 interface AccessibilityIssue {
   id: string;
   blockId: string;
+  termId?: string;
   type: "heading" | "link" | "image" | "glossary" | "sentence";
   severity: Severity;
   title: string;
   detail: string;
   suggestion: string;
+}
+
+type IssueStatus = "open" | "resolved" | "waived";
+
+interface IssueAcceptance {
+  assignee: string;
+  status: IssueStatus;
+  note: string;
+  waiveReason: string;
+  resolvedAt: string;
+  resolvedBy: string;
+  resolvedSignature: string;
+  reopenedAt: string;
+  /** 问题在最近一次检查中暂时检测不到（如逐字编辑的中间态），保留记录以便恢复。 */
+  gone?: boolean;
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
@@ -167,6 +184,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    issueAcceptance: {},
     updatedAt: new Date().toISOString(),
   };
 }
@@ -287,6 +305,7 @@ function analyze(project: ChapterProject): AccessibilityIssue[] {
         issues.push({
           id: `term-${block.id}-${term.id}`,
           blockId: block.id,
+          termId: term.id,
           type: "glossary",
           severity: "info",
           title: `术语“${term.source}”尚未统一`,
@@ -297,6 +316,135 @@ function analyze(project: ChapterProject): AccessibilityIssue[] {
     }
   }
   return issues;
+}
+
+/**
+ * 计算问题所依赖的内容指纹。正文、标题、术语等相关内容一旦改变，指纹就不同，
+ * 已经解决/放行的旧结论会因此失效，问题重新回到待处理状态。
+ */
+function issueSignature(issue: AccessibilityIssue, project: ChapterProject): string {
+  const block = project.blocks.find((item) => item.id === issue.blockId);
+  if (!block) return `missing:${issue.id}`;
+  const sentenceIndex = issue.type === "sentence"
+    ? Number(issue.id.slice(issue.id.lastIndexOf("-") + 1))
+    : -1;
+  switch (issue.type) {
+    case "heading":
+      return `heading:l${block.headingLevel ?? 2}:${block.text}`;
+    case "image":
+      return `image:${block.imageAlt ?? ""}|${block.accessibleText}`;
+    case "link":
+      return `link:${block.accessibleText}|${block.text}`;
+    case "glossary": {
+      const term = project.glossary.find((item) => item.id === issue.termId);
+      return `glossary:${block.text}|${block.accessibleText}|${term ? `${term.source}>${term.preferred}` : "term-removed"}`;
+    }
+    case "sentence": {
+      const sentences = block.text.split(/(?<=[。！？!?])\s*/).filter(Boolean);
+      return `sentence:${sentences[sentenceIndex] ?? block.text}`;
+    }
+  }
+}
+
+/**
+ * 按当前检查结果对账验收记录：
+ * - 问题仍存在但其依赖内容已改变：把已解决/已放行结论打回待处理（保留处理人）；
+ * - 问题暂时检测不到但内容块仍在：多为逐字编辑的中间态，先标记 gone 保留结论；
+ *   再次出现时按指纹决定恢复还是打回；
+ * - 内容块被删除（问题永久消失）：清理记录；
+ * - 待处理记录保持不变。
+ */
+function reconcileAcceptance(draft: ChapterProject) {
+  if (!draft.issueAcceptance) draft.issueAcceptance = {};
+  const current = analyze(draft);
+  const live = new Map(current.map((issue) => [issue.id, issue]));
+  for (const [issueId, acceptance] of Object.entries(draft.issueAcceptance)) {
+    const issue = live.get(issueId);
+    if (!issue) {
+      // 内容块被真正删除时清理记录；否则可能只是逐字编辑的中间态，先保留为 gone。
+      const blockStillExists = draft.blocks.some((block) => block.id === blockIdOfIssue(issueId));
+      if (!blockStillExists) {
+        delete draft.issueAcceptance[issueId];
+      } else if (!acceptance.gone) {
+        draft.issueAcceptance[issueId] = { ...acceptance, gone: true };
+      }
+      continue;
+    }
+    if (acceptance.gone) {
+      // 问题在中间态消失后又出现：内容已变则结论失效；内容相同则恢复原结论。
+      if (acceptance.status !== "open" && acceptance.resolvedSignature !== issueSignature(issue, draft)) {
+        draft.issueAcceptance[issueId] = reopenAcceptance(acceptance);
+      } else {
+        draft.issueAcceptance[issueId] = { ...acceptance, gone: false };
+      }
+      continue;
+    }
+    if (acceptance.status !== "open" && acceptance.resolvedSignature !== issueSignature(issue, draft)) {
+      draft.issueAcceptance[issueId] = reopenAcceptance(acceptance);
+    }
+  }
+}
+
+function blockIdOfIssue(issueId: string): string {
+  // analyze() 生成的 id：image-<block>、link-<block>、heading-<block>、sentence-<block>-<index>、term-<block>-<termId>
+  const body = issueId.replace(/^(image|link|heading|sentence|term)-/, "");
+  if (issueId.startsWith("sentence-")) return body.replace(/-\d+$/, "");
+  if (issueId.startsWith("term-")) return body.slice(0, body.lastIndexOf("-"));
+  return body;
+}
+
+function reopenAcceptance(acceptance: IssueAcceptance): IssueAcceptance {
+  return {
+    assignee: acceptance.assignee,
+    status: "open",
+    note: "",
+    waiveReason: "",
+    resolvedAt: "",
+    resolvedBy: "",
+    resolvedSignature: "",
+    reopenedAt: new Date().toISOString(),
+    gone: false,
+  };
+}
+
+function ensureAcceptance(project: ChapterProject, issueId: string): IssueAcceptance {
+  return project.issueAcceptance[issueId] ?? {
+    assignee: "",
+    status: "open",
+    note: "",
+    waiveReason: "",
+    resolvedAt: "",
+    resolvedBy: "",
+    resolvedSignature: "",
+    reopenedAt: "",
+    gone: false,
+  };
+}
+
+function collectAssignees(project: ChapterProject): string[] {
+  const names = new Set<string>();
+  for (const acceptance of Object.values(project.issueAcceptance)) {
+    if (acceptance.assignee.trim()) names.add(acceptance.assignee.trim());
+  }
+  return [...names];
+}
+
+/** 从 DOM 读取某个问题当前正在编辑的处理人与说明（同一问题在编辑区和验收区各有一份输入）。 */
+function syncIssueDraft(issueId: string) {
+  let changed = false;
+  let acceptance = project.issueAcceptance[issueId] ?? ensureAcceptance(project, issueId);
+  app.querySelectorAll<HTMLElement>(`[data-issue-assignee="${CSS.escape(issueId)}"]`).forEach((element) => {
+    const value = (element as HTMLElement & { value: string }).value;
+    if (value !== acceptance.assignee) { acceptance = { ...acceptance, assignee: value }; changed = true; }
+  });
+  app.querySelectorAll<HTMLElement>(`[data-issue-note="${CSS.escape(issueId)}"]`).forEach((element) => {
+    const value = (element as HTMLElement & { value: string }).value;
+    if (value !== acceptance.note) { acceptance = { ...acceptance, note: value }; changed = true; }
+  });
+  if (changed) {
+    project.issueAcceptance[issueId] = acceptance;
+    saveSoon();
+  }
 }
 
 function simplifyText(input: string, glossary: GlossaryTerm[]) {
@@ -391,7 +539,15 @@ function download(filename: string, content: string, type = "text/html;charset=u
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) {
+      if (!stored.project.issueAcceptance) stored.project.issueAcceptance = {};
+      // gone 只是逐字编辑中间态，跨会话无意义，加载时先丢弃再按当前内容对账。
+      for (const [id, acceptance] of Object.entries(stored.project.issueAcceptance)) {
+        if (acceptance.gone) delete stored.project.issueAcceptance[id];
+      }
+      reconcileAcceptance(stored.project);
+      return stored.project;
+    }
   } catch {
     // Fall back to the bundled sample.
   }
@@ -408,6 +564,8 @@ let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let issueFilter: "open" | "all" = "open";
+let showExportBlocker = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
@@ -427,6 +585,7 @@ function commit(label: string, update: (draft: ChapterProject) => void, renderAf
   redoStack = [];
   const draft = structuredClone(project);
   update(draft);
+  reconcileAcceptance(draft);
   draft.updatedAt = new Date().toISOString();
   project = draft;
   document.documentElement.dataset.lastAction = label;
@@ -440,6 +599,7 @@ function undo() {
   redoStack = [structuredClone(project), ...redoStack].slice(0, 50);
   project = previous;
   if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
+  reconcileAcceptance(project);
   saveSoon();
   render();
 }
@@ -449,6 +609,7 @@ function redo() {
   if (!next) return;
   undoStack = [...undoStack.slice(-49), structuredClone(project)];
   project = next;
+  reconcileAcceptance(project);
   saveSoon();
   render();
 }
@@ -460,12 +621,50 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+function closeIssue(issue: AccessibilityIssue, waive: boolean) {
+  // 先同步用户尚未失焦的输入，避免填完直接点按钮时丢失处理人或说明。
+  syncIssueDraft(issue.id);
+  const current = ensureAcceptance(project, issue.id);
+  const note = current.note.trim();
+  if (!note) {
+    document.documentElement.dataset.lastAction = waive ? "放行失败：必须写明理由" : "解决失败：请先填写处理说明";
+    render();
+    requestAnimationFrame(() => {
+      const field = app.querySelector<HTMLElement>(`[data-issue-note="${CSS.escape(issue.id)}"]`);
+      field?.setAttribute("data-invalid", "true");
+      (field as unknown as { focus?: () => void })?.focus?.();
+    });
+    return;
+  }
+  if (waive && issue.severity === "error") return;
+  commit(waive ? "带理由放行问题" : "标记问题已解决", (draft) => {
+    const acceptance = ensureAcceptance(draft, issue.id);
+    const now = new Date().toISOString();
+    draft.issueAcceptance[issue.id] = {
+      assignee: acceptance.assignee,
+      status: waive ? "waived" : "resolved",
+      note,
+      waiveReason: waive ? note : "",
+      resolvedAt: now,
+      resolvedBy: acceptance.assignee || "当前编辑",
+      resolvedSignature: issueSignature(issue, draft),
+      reopenedAt: "",
+      gone: false,
+    };
+  });
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const openIssues = list.filter((issue) => ensureAcceptance(project, issue.id).status === "open");
+  const resolvedCount = list.filter((issue) => ensureAcceptance(project, issue.id).status === "resolved").length;
+  const waivedCount = list.filter((issue) => ensureAcceptance(project, issue.id).status === "waived").length;
+  const panelIssues = issueFilter === "open" ? openIssues : list;
+  const assigneeOptions = collectAssignees(project);
 
   app.innerHTML = `
     <div class="app-shell">
@@ -489,9 +688,10 @@ function render() {
         <div class="progress-copy"><b>${approved}/${project.blocks.length}</b><span>内容块已审核通过</span></div>
         <div class="progress-bar"><i style="width:${Math.round((approved / Math.max(1, project.blocks.length)) * 100)}%"></i></div>
         <div class="issue-counts">
-          <span class="error">${list.filter((issue) => issue.severity === "error").length} 必须修复</span>
-          <span class="warning">${list.filter((issue) => issue.severity === "warning").length} 建议优化</span>
-          <span class="info">${list.filter((issue) => issue.severity === "info").length} 术语提醒</span>
+          <span class="error">${openIssues.filter((issue) => issue.severity === "error").length} 必须修复未处理</span>
+          <span class="warning">${openIssues.filter((issue) => issue.severity === "warning").length} 建议项未处理</span>
+          <span class="info">${openIssues.filter((issue) => issue.severity === "info").length} 提醒未处理</span>
+          <span class="done-count">${resolvedCount} 已解决 · ${waivedCount} 已放行</span>
         </div>
       </div>
 
@@ -500,7 +700,7 @@ function render() {
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
           <div class="block-list">
             ${project.blocks.map((block, index) => {
-              const blockIssues = list.filter((issue) => issue.blockId === block.id);
+              const blockIssues = list.filter((issue) => issue.blockId === block.id && ensureAcceptance(project, issue.id).status === "open");
               return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
@@ -525,8 +725,9 @@ function render() {
 
           ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
             <div class="issue-card ${issue.severity}">
-              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong></div>
+              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong>${renderIssueStatusBadge(issue)}</div>
               <p>${escapeHtml(issue.detail)}</p><small>${escapeHtml(issue.suggestion)}</small>
+              ${renderIssueAcceptance(issue, assigneeOptions, "editor")}
             </div>`).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
 
           <section class="edit-card source-card">
@@ -572,10 +773,20 @@ function render() {
             </ol>
           </section>
 
-          <section class="issues-panel">
-            <div class="section-heading"><div><span class="eyebrow">All checks</span><h2>全章问题</h2></div><sl-button size="small" variant="default" outline data-action="approve-all">全部通过</sl-button></div>
-            <div class="issue-list">
-              ${list.length ? list.map((issue) => `<button class="${issue.id === activeIssueId ? "active" : ""} ${issue.severity}" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}"><span>${severityLabel(issue.severity)}</span><b>${escapeHtml(issue.title)}</b><small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1} · ${escapeHtml(issue.suggestion)}</small></button>`).join("") : `<div class="issue-clear">✓ 全章检查通过</div>`}
+          <section class="issues-panel acceptance-panel">
+            <div class="section-heading"><div><span class="eyebrow">Release acceptance</span><h2>发布前验收</h2></div><sl-badge variant="${openIssues.length ? "danger" : "success"}">${openIssues.length} 待处理</sl-badge></div>
+            <div class="acceptance-summary">
+              <span class="error">必须修复 ${list.filter((i) => i.severity === "error").length}（未处理 ${list.filter((i) => i.severity === "error" && ensureAcceptance(project, i.id).status === "open").length}）</span>
+              <span class="warning">建议 ${list.filter((i) => i.severity === "warning").length}（未处理 ${list.filter((i) => i.severity === "warning" && ensureAcceptance(project, i.id).status === "open").length}）</span>
+              <span class="info">提醒 ${list.filter((i) => i.severity === "info").length}（未处理 ${list.filter((i) => i.severity === "info" && ensureAcceptance(project, i.id).status === "open").length}）</span>
+            </div>
+            <div class="mode-switch issue-filter">
+              <button class="${issueFilter === "open" ? "active" : ""}" data-action="filter-issues" data-filter="open">只看未处理 (${openIssues.length})</button>
+              <button class="${issueFilter === "all" ? "active" : ""}" data-action="filter-issues" data-filter="all">全部 (${list.length})</button>
+            </div>
+            <datalist id="assignee-options">${assigneeOptions.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("")}</datalist>
+            <div class="issue-list acceptance-list">
+              ${panelIssues.length ? panelIssues.map((issue) => renderIssueItem(issue, assigneeOptions)).join("") : `<div class="issue-clear">${issueFilter === "open" ? "✓ 所有问题都已处理，可以导出" : "✓ 全章检查通过"}</div>`}
             </div>
           </section>
 
@@ -589,8 +800,13 @@ function render() {
         </aside>
       </div>
 
-      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
+      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${openIssues.length} 个未处理问题（共 ${list.length}）</span></footer>
     </div>
+
+    <sl-dialog label="导出被拦截：发布前验收未完成" ${showExportBlocker ? "open" : ""} data-dialog="export-blocker">
+      ${renderExportBlocker(openIssues)}
+      <sl-button slot="footer" variant="primary" data-action="close-export-blocker">返回处理</sl-button>
+    </sl-dialog>
 
     <sl-dialog label="全书术语表" ${showGlossary ? "open" : ""} data-dialog="glossary">
       <div class="glossary-editor">
@@ -601,6 +817,77 @@ function render() {
     </sl-dialog>`;
 
   wireLiveFields();
+}
+
+function renderIssueStatusBadge(issue: AccessibilityIssue) {
+  const acceptance = ensureAcceptance(project, issue.id);
+  if (acceptance.status === "resolved") return `<sl-badge variant="success" class="accept-badge">✓ 已解决</sl-badge>`;
+  if (acceptance.status === "waived") return `<sl-badge variant="neutral" class="accept-badge">已带理由放行</sl-badge>`;
+  return `<sl-badge variant="warning" class="accept-badge">待处理</sl-badge>`;
+}
+
+function renderIssueAcceptance(issue: AccessibilityIssue, assigneeOptions: string[], scope: string) {
+  const acceptance = ensureAcceptance(project, issue.id);
+  if (acceptance.status !== "open") {
+    const closed = acceptance.status === "resolved";
+    const reasonText = closed ? acceptance.note : acceptance.waiveReason;
+    return `
+      <div class="acceptance-box ${acceptance.status}">
+        <div class="acceptance-meta">
+          <b>${closed ? "✓ 已标记解决" : "已带理由放行"}</b>
+          <span>处理人：${escapeHtml(acceptance.assignee || "未指派")}</span>
+          <span>${new Date(acceptance.resolvedAt).toLocaleString()}</span>
+        </div>
+        <p class="acceptance-note">${closed ? "处理说明" : "放行理由"}：${escapeHtml(reasonText)}</p>
+        <sl-button size="small" variant="default" outline data-action="reopen-issue" data-issue-id="${issue.id}">重新打开</sl-button>
+      </div>`;
+  }
+  const errorBlocked = issue.severity === "error";
+  const errorText = acceptance.reopenedAt ? "内容在上次处理后有改动，请复核后重新处理。" : "";
+  return `
+    <div class="acceptance-box open">
+      ${errorText ? `<p class="reopen-hint">⟳ ${escapeHtml(errorText)}</p>` : ""}
+      <div class="acceptance-assignee">
+        <label for="${scope}-assignee-${issue.id}">指派给</label>
+        <sl-input id="${scope}-assignee-${issue.id}" size="small" list="assignee-options" placeholder="输入处理人姓名" value="${escapeHtml(acceptance.assignee)}" data-issue-assignee="${issue.id}"></sl-input>
+      </div>
+      <sl-textarea size="small" rows="2" placeholder="${errorBlocked ? "处理说明：修复后填写做了什么" : "放行需写明理由；已修复可写处理说明"}" value="${escapeHtml(acceptance.note)}" data-issue-note="${issue.id}"></sl-textarea>
+      <div class="acceptance-actions">
+        <sl-button size="small" variant="success" data-action="resolve-issue" data-issue-id="${issue.id}">标记解决</sl-button>
+        <sl-button size="small" variant="${errorBlocked ? "default" : "warning"}" outline ${errorBlocked ? "disabled" : ""} data-action="waive-issue" data-issue-id="${issue.id}">带理由放行</sl-button>
+        ${errorBlocked ? `<small class="blocked-hint">必须修复项不允许放行</small>` : `<small class="blocked-hint">建议/提醒项可放行，但必须写明理由</small>`}
+      </div>
+    </div>`;
+}
+
+function renderIssueItem(issue: AccessibilityIssue, assigneeOptions: string[]) {
+  const acceptance = ensureAcceptance(project, issue.id);
+  const blockIndex = project.blocks.findIndex((block) => block.id === issue.blockId) + 1;
+  return `<div class="issue-entry ${issue.severity} ${acceptance.status} ${issue.id === activeIssueId ? "active" : ""}">
+    <button class="issue-head" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}">
+      <span>${severityLabel(issue.severity)}</span>
+      <b>${escapeHtml(issue.title)}</b>
+      <small>段 ${blockIndex} · ${escapeHtml(issue.suggestion)}</small>
+      ${renderIssueStatusBadge(issue)}
+    </button>
+    <div class="issue-entry-body">${renderIssueAcceptance(issue, assigneeOptions, "list")}</div>
+  </div>`;
+}
+
+function renderExportBlocker(openIssues: AccessibilityIssue[]) {
+  const openErrors = openIssues.filter((issue) => issue.severity === "error");
+  const openOthers = openIssues.filter((issue) => issue.severity !== "error");
+  const unassigned = openIssues.filter((issue) => !ensureAcceptance(project, issue.id).assignee.trim());
+  return `<div class="export-blocker">
+    <p>还有 <b>${openIssues.length}</b> 个问题没有处理完，不能导出无障碍 HTML：</p>
+    <ul>
+      <li class="error"><b>${openErrors.length}</b> 个必须修复项未标记解决（必须修复项不允许放行）。</li>
+      <li class="warning"><b>${openOthers.length}</b> 个建议/提醒项尚未解决或带理由放行。</li>
+      ${unassigned.length ? `<li class="info"><b>${unassigned.length}</b> 个问题还没有指派处理人。</li>` : ""}
+    </ul>
+    ${openErrors.length ? `<div class="blocker-list"><b>必须修复：</b>${openErrors.slice(0, 5).map((issue) => `<button class="blocker-jump" data-action="jump-blocker-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}">${escapeHtml(issue.title)}<small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1}</small></button>`).join("")}</div>` : ""}
+    ${!openErrors.length && openOthers.length ? `<p class="blocker-ok">必须修复项已全部解决；建议项请修复后标记解决，或在“带理由放行”中写明理由。</p>` : ""}
+  </div>`;
 }
 
 function renderSourceEditor(block: ContentBlock) {
@@ -689,6 +976,31 @@ app.addEventListener("click", (event) => {
     render();
     requestAnimationFrame(() => app.querySelector<HTMLElement>(".editor-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
+  if (action === "filter-issues") {
+    issueFilter = target.dataset.filter === "all" ? "all" : "open";
+    render();
+  }
+  if (action === "resolve-issue" || action === "waive-issue") {
+    const issueId = target.dataset.issueId ?? "";
+    const issue = issues().find((item) => item.id === issueId);
+    if (issue) closeIssue(issue, action === "waive-issue");
+  }
+  if (action === "reopen-issue") {
+    const issueId = target.dataset.issueId ?? "";
+    commit("重新打开问题", (draft) => {
+      const acceptance = draft.issueAcceptance[issueId];
+      if (acceptance) draft.issueAcceptance[issueId] = reopenAcceptance(acceptance);
+    });
+  }
+  if (action === "close-export-blocker") { showExportBlocker = false; render(); }
+  if (action === "jump-blocker-issue") {
+    activeIssueId = target.dataset.issueId ?? "";
+    activeBlockId = target.dataset.blockId ?? activeBlockId;
+    issueFilter = "open";
+    showExportBlocker = false;
+    render();
+    requestAnimationFrame(() => app.querySelector<HTMLElement>(".acceptance-panel")?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  }
   if (action === "generate") {
     const block = activeBlock();
     const suggestion = block.type === "link"
@@ -749,10 +1061,15 @@ app.addEventListener("click", (event) => {
     selectedVersionId = versionId;
     render();
   }
-  if (action === "approve-all") {
-    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
-  }
   if (action === "export") {
+    const open = issues().filter((issue) => ensureAcceptance(project, issue.id).status === "open");
+    if (open.length) {
+      showExportBlocker = true;
+      issueFilter = "open";
+      document.documentElement.dataset.lastAction = "导出被拦截：仍有未处理问题";
+      render();
+      return;
+    }
     download(`${project.title}-无障碍版.html`, exportHtml(project));
     document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
     render();
@@ -763,6 +1080,11 @@ app.addEventListener("click", (event) => {
 app.addEventListener("sl-change", (event) => {
   const element = event.target as HTMLElement;
   if (element.id === "chapter-file") return;
+  if (element.hasAttribute("data-issue-assignee")) {
+    const issueId = element.getAttribute("data-issue-assignee") ?? "";
+    syncIssueDraft(issueId);
+    return;
+  }
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
     updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
@@ -798,6 +1120,15 @@ app.addEventListener("input", (event) => {
   }
 });
 
+app.addEventListener("sl-input", (event) => {
+  const element = event.target as HTMLElement;
+  if (element.hasAttribute("data-issue-note")) {
+    const issueId = element.getAttribute("data-issue-note") ?? "";
+    syncIssueDraft(issueId);
+    element.removeAttribute("data-invalid");
+  }
+});
+
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
 window.addEventListener("keydown", (event) => {
@@ -817,7 +1148,9 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key.toLowerCase() === "j" || event.key.toLowerCase() === "k") {
-    const list = issues();
+    const all = issues();
+    const navigable = all.filter((issue) => ensureAcceptance(project, issue.id).status === "open");
+    const list = navigable.length ? navigable : all;
     if (!list.length) return;
     const current = Math.max(0, list.findIndex((issue) => issue.id === activeIssueId));
     const next = (current + (event.key.toLowerCase() === "j" ? 1 : -1) + list.length) % list.length;
