@@ -56,6 +56,7 @@ interface ChapterProject {
   grade: string;
   blocks: ContentBlock[];
   glossary: GlossaryTerm[];
+  issueReviews: IssueReview[];
   versions: VersionSnapshot[];
   updatedAt: string;
 }
@@ -68,6 +69,41 @@ interface AccessibilityIssue {
   title: string;
   detail: string;
   suggestion: string;
+}
+
+type IssueReviewStatus = "pending" | "resolved" | "waived";
+
+interface IssueOutcome {
+  status: "resolved" | "waived";
+  note: string;
+  assignee: string;
+  signedAt: string;
+}
+
+interface IssueReview {
+  issueId: string;
+  blockId: string;
+  type: AccessibilityIssue["type"];
+  severity: Severity;
+  title: string;
+  assignee: string;
+  note: string;
+  status: IssueReviewStatus;
+  signedAt: string;
+  fingerprint: string;
+  previousOutcome?: IssueOutcome;
+}
+
+interface AcceptanceRow {
+  review: IssueReview;
+  order: number;
+  present: boolean;
+}
+
+interface ExportBlocker {
+  review: IssueReview;
+  present: boolean;
+  blockIndex: number;
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
@@ -166,6 +202,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-2", source: "地表径流", preferred: "沿地面流动的水", note: "首次出现时使用通俗解释" },
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
+    issueReviews: [],
     versions: [],
     updatedAt: new Date().toISOString(),
   };
@@ -299,6 +336,130 @@ function analyze(project: ChapterProject): AccessibilityIssue[] {
   return issues;
 }
 
+function parseIssueId(project: ChapterProject, issueId: string) {
+  const parts = issueId.split("-");
+  if (issueId.startsWith("sentence-")) {
+    const sentenceIndex = Number(parts[parts.length - 1]);
+    return { type: "sentence" as const, blockId: parts.slice(1, -1).join("-"), sentenceIndex };
+  }
+  if (issueId.startsWith("term-")) {
+    const termId = `term-${parts[parts.length - 1]}`;
+    const blockId = parts.slice(1, -2).join("-");
+    return { type: "glossary" as const, blockId, term: project.glossary.find((term) => term.id === termId) };
+  }
+  return { type: parts[0] as "heading" | "link" | "image", blockId: parts.slice(1).join("-") };
+}
+
+// 指纹描述问题所依赖的内容：正文、标题、链接、替代文本或术语一旦改动，
+// 已经签署的结论就会与指纹不匹配，从而重新变为待处理。
+function issueFingerprint(project: ChapterProject, issueId: string): string {
+  const parsed = parseIssueId(project, issueId);
+  const block = project.blocks.find((item) => item.id === parsed.blockId);
+  if (parsed.type === "glossary") {
+    if (!parsed.term) return "term:missing";
+    const joined = block ? `${block.text}${block.accessibleText}` : "";
+    return `term:${joined}|${parsed.term.source}|${parsed.term.preferred}`;
+  }
+  if (!block) return `${parsed.type}:missing-block`;
+  if (parsed.type === "heading") {
+    let chain = "";
+    for (const item of project.blocks) {
+      if (item.type === "heading") {
+        chain += `${item.headingLevel ?? 2}:${item.text}`;
+        if (item.id === block.id) break;
+      }
+    }
+    return `heading:${block.headingLevel ?? 2}|${block.text}|${chain}`;
+  }
+  if (parsed.type === "image") {
+    return `image:${block.imageAlt ?? ""}|${block.accessibleText}`;
+  }
+  if (parsed.type === "link") {
+    return `link:${block.accessibleText}|${block.text}|${block.linkHref ?? ""}`;
+  }
+  const sentences = block.text.split(/(?<=[。！？!?])\s*/).filter(Boolean);
+  const sentence = sentences[parsed.sentenceIndex ?? 0] ?? "";
+  // 原文与无障碍表达都属于“正文”：任一处改动都会使旧结论失效。
+  return `sentence:${sentence.length}|${sentence}|acc:${block.accessibleText}`;
+}
+
+function syncIssueReviews(draft: ChapterProject, mode: "commit" | "restore" = "commit") {
+  const live = analyze(draft);
+  const liveById = new Map(live.map((issue) => [issue.id, issue]));
+  const existing = new Map(draft.issueReviews.map((review) => [review.issueId, review]));
+  const next: IssueReview[] = [];
+
+  for (const issue of live) {
+    const previous = existing.get(issue.id);
+    const fingerprint = issueFingerprint(draft, issue.id);
+    if (previous) {
+      // 常规提交：指纹变化即判定旧结论失效。
+      // 撤销/重做恢复的是历史快照，直接信任快照中的结论并重放指纹。
+      const stale = mode === "commit" && previous.status !== "pending" && previous.fingerprint !== fingerprint;
+      const archived: IssueOutcome | undefined = stale ? {
+        status: previous.status === "waived" ? "waived" : "resolved",
+        note: previous.note,
+        assignee: previous.assignee,
+        signedAt: previous.signedAt,
+      } : undefined;
+      next.push({
+        ...previous,
+        blockId: issue.blockId,
+        type: issue.type,
+        severity: issue.severity,
+        title: issue.title,
+        fingerprint,
+        // 内容改动导致指纹变化：旧结论失效，问题重新待处理；
+        // 指纹未变（例如刚完成签署）时保留原结论；未处理项始终跟踪最新内容。
+        status: stale ? "pending" : previous.status,
+        previousOutcome: stale ? archived : mode === "restore" ? undefined : previous.previousOutcome,
+      });
+    } else {
+      next.push({
+        issueId: issue.id,
+        blockId: issue.blockId,
+        type: issue.type,
+        severity: issue.severity,
+        title: issue.title,
+        assignee: "",
+        note: "",
+        status: "pending",
+        signedAt: "",
+        fingerprint,
+      });
+    }
+  }
+
+  for (const review of draft.issueReviews) {
+    if (liveById.has(review.issueId)) continue;
+    const fingerprint = issueFingerprint(draft, review.issueId);
+    const stale = mode === "commit" && review.status !== "pending" && review.fingerprint !== fingerprint;
+    if (stale) {
+      // 正文、标题、术语或替代文本改动后，旧的解决/放行结论不再可信，统一重新待处理。
+      next.push({
+        ...review,
+        status: "pending",
+        signedAt: "",
+        fingerprint,
+        previousOutcome: {
+          status: review.status === "waived" ? "waived" : "resolved",
+          note: review.note,
+          assignee: review.assignee,
+          signedAt: review.signedAt,
+        },
+      });
+    } else if (mode === "restore") {
+      // 恢复撤销/重做快照时，用当前内容重放指纹，使历史结论重新有效。
+      next.push({ ...review, fingerprint, previousOutcome: undefined });
+    } else {
+      // 指纹未变（例如本次提交正是把问题标记为“已解决”，问题随即不再检出）：保留结论。
+      next.push({ ...review, fingerprint });
+    }
+  }
+
+  draft.issueReviews = next;
+}
+
 function simplifyText(input: string, glossary: GlossaryTerm[]) {
   let result = input
     .replaceAll("由于其", "因为")
@@ -389,13 +550,17 @@ function download(filename: string, content: string, type = "text/html;charset=u
 }
 
 function loadProject(): ChapterProject {
+  let loaded: ChapterProject | null = null;
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) loaded = stored.project;
   } catch {
     // Fall back to the bundled sample.
   }
-  return createSeedProject();
+  const draft = loaded ?? createSeedProject();
+  if (!Array.isArray(draft.issueReviews)) draft.issueReviews = [];
+  syncIssueReviews(draft);
+  return draft;
 }
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
@@ -408,12 +573,24 @@ let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let issueFilterOpenOnly = false;
+let exportBlockers: ExportBlocker[] | null = null;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+const issueReviewMap = () => new Map(project.issueReviews.map((review) => [review.issueId, review]));
+const blockIndex = (blockId: string) => project.blocks.findIndex((block) => block.id === blockId);
+
+function acceptanceRows(): AcceptanceRow[] {
+  const liveIds = new Set(issues().map((issue) => issue.id));
+  return project.issueReviews.map((review, index) => ({ review, order: index, present: liveIds.has(review.issueId) }));
+}
+
+const isReviewOpen = (review: IssueReview) => review.status === "pending";
+const openReviews = () => project.issueReviews.filter(isReviewOpen);
 
 function saveSoon() {
   window.clearTimeout(saveTimer);
@@ -427,6 +604,7 @@ function commit(label: string, update: (draft: ChapterProject) => void, renderAf
   redoStack = [];
   const draft = structuredClone(project);
   update(draft);
+  syncIssueReviews(draft);
   draft.updatedAt = new Date().toISOString();
   project = draft;
   document.documentElement.dataset.lastAction = label;
@@ -439,6 +617,7 @@ function undo() {
   if (!previous) return;
   redoStack = [structuredClone(project), ...redoStack].slice(0, 50);
   project = previous;
+  syncIssueReviews(project, "restore");
   if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
   saveSoon();
   render();
@@ -449,6 +628,7 @@ function redo() {
   if (!next) return;
   undoStack = [...undoStack.slice(-49), structuredClone(project)];
   project = next;
+  syncIssueReviews(project, "restore");
   saveSoon();
   render();
 }
@@ -466,6 +646,10 @@ function render() {
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const rows = acceptanceRows();
+  const openRows = rows.filter((row) => isReviewOpen(row.review));
+  const reviewById = issueReviewMap();
+  const pendingBySeverity = (severity: Severity) => rows.filter((row) => isReviewOpen(row.review) && row.review.severity === severity).length;
 
   app.innerHTML = `
     <div class="app-shell">
@@ -489,9 +673,9 @@ function render() {
         <div class="progress-copy"><b>${approved}/${project.blocks.length}</b><span>内容块已审核通过</span></div>
         <div class="progress-bar"><i style="width:${Math.round((approved / Math.max(1, project.blocks.length)) * 100)}%"></i></div>
         <div class="issue-counts">
-          <span class="error">${list.filter((issue) => issue.severity === "error").length} 必须修复</span>
-          <span class="warning">${list.filter((issue) => issue.severity === "warning").length} 建议优化</span>
-          <span class="info">${list.filter((issue) => issue.severity === "info").length} 术语提醒</span>
+          <span class="error">${pendingBySeverity("error")} 必须修复待处理</span>
+          <span class="warning">${pendingBySeverity("warning")} 建议项待处理</span>
+          <span class="info">${pendingBySeverity("info")} 提醒待处理</span>
         </div>
       </div>
 
@@ -500,12 +684,12 @@ function render() {
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
           <div class="block-list">
             ${project.blocks.map((block, index) => {
-              const blockIssues = list.filter((issue) => issue.blockId === block.id);
+              const pendingCount = project.issueReviews.filter((review) => review.blockId === block.id && isReviewOpen(review)).length;
               return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
-                ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
+                ${pendingCount ? `<em>${pendingCount}</em>` : ""}
               </button>`;
             }).join("")}
           </div>
@@ -523,11 +707,15 @@ function render() {
             </div>
           </div>
 
-          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
+          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => {
+            const review = reviewById.get(issue.id);
+            return `
             <div class="issue-card ${issue.severity}">
-              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong></div>
+              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong>${review ? reviewStatusBadge(review) : ""}</div>
               <p>${escapeHtml(issue.detail)}</p><small>${escapeHtml(issue.suggestion)}</small>
-            </div>`).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
+              ${review && review.status !== "pending" ? `<footer class="issue-signoff"><span>${review.status === "resolved" ? "✓ 已解决" : "↷ 已带理由放行"} · ${escapeHtml(review.assignee || "未指派")} · ${new Date(review.signedAt).toLocaleString()}</span><p>${escapeHtml(review.note)}</p></footer>` : review?.assignee ? `<footer class="issue-signoff pending"><span>处理人：${escapeHtml(review.assignee)}</span></footer>` : ""}
+            </div>`;
+          }).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
 
           <section class="edit-card source-card">
             <div class="section-heading"><div><span class="eyebrow">原教材</span><h2>${active.type === "image" ? "图片信息" : active.type === "link" ? "链接信息" : "原文"}</h2></div><sl-badge variant="neutral">${active.type}</sl-badge></div>
@@ -572,10 +760,14 @@ function render() {
             </ol>
           </section>
 
-          <section class="issues-panel">
-            <div class="section-heading"><div><span class="eyebrow">All checks</span><h2>全章问题</h2></div><sl-button size="small" variant="default" outline data-action="approve-all">全部通过</sl-button></div>
-            <div class="issue-list">
-              ${list.length ? list.map((issue) => `<button class="${issue.id === activeIssueId ? "active" : ""} ${issue.severity}" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}"><span>${severityLabel(issue.severity)}</span><b>${escapeHtml(issue.title)}</b><small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1} · ${escapeHtml(issue.suggestion)}</small></button>`).join("") : `<div class="issue-clear">✓ 全章检查通过</div>`}
+          <section class="issues-panel acceptance-panel">
+            <div class="section-heading"><div><span class="eyebrow">Pre-release acceptance</span><h2>发布前验收</h2></div><sl-badge variant="${openRows.length ? "warning" : "success"}">${openRows.length ? `${openRows.length} 待处理` : "可发布"}</sl-badge></div>
+            <div class="acceptance-progress">
+              <div class="acceptance-counts"><b>${rows.length - openRows.length}/${rows.length}</b><span>已验收</span></div>
+              <button class="filter-toggle ${issueFilterOpenOnly ? "active" : ""}" data-action="toggle-open-only" aria-pressed="${issueFilterOpenOnly}">${issueFilterOpenOnly ? "✓ 只看未处理" : "只看未处理"}</button>
+            </div>
+            <div class="acceptance-list">
+              ${renderAcceptanceList(issueFilterOpenOnly ? openRows : rows)}
             </div>
           </section>
 
@@ -589,7 +781,7 @@ function render() {
         </aside>
       </div>
 
-      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
+      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${openRows.length} 个验收项待处理</span></footer>
     </div>
 
     <sl-dialog label="全书术语表" ${showGlossary ? "open" : ""} data-dialog="glossary">
@@ -598,6 +790,11 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
+    </sl-dialog>
+
+    <sl-dialog label="导出被拦截：还有验收项未处理" ${exportBlockers ? "open" : ""} data-dialog="export-blockers">
+      ${renderExportBlockers(exportBlockers)}
+      <sl-button slot="footer" variant="primary" outline data-action="close-export-blockers">返回继续处理</sl-button>
     </sl-dialog>`;
 
   wireLiveFields();
@@ -648,6 +845,107 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
 
+function reviewStatusBadge(review: IssueReview) {
+  if (review.status === "resolved") return `<sl-badge variant="success">✓ 已解决</sl-badge>`;
+  if (review.status === "waived") return `<sl-badge variant="neutral">↷ 已放行</sl-badge>`;
+  return `<sl-badge variant="warning">待处理</sl-badge>`;
+}
+
+function reviewMeta(review: IssueReview, present: boolean) {
+  const index = blockIndex(review.blockId);
+  const location = index >= 0 ? `块 ${index + 1}` : "内容块已不在正文中";
+  const state = present ? "" : " · 已修改，问题未再检出";
+  return `${escapeHtml(location)}${state}`;
+}
+
+function renderAcceptanceList(rows: AcceptanceRow[]) {
+  if (!rows.length) return `<div class="issue-clear">✓ 验收项均已处理，可以导出</div>`;
+  const order: IssueReviewStatus[] = ["pending", "waived", "resolved"];
+  const severityOrder: Record<Severity, number> = { error: 0, warning: 1, info: 2 };
+  const sorted = [...rows].sort((a, b) => {
+    const statusGap = order.indexOf(a.review.status) - order.indexOf(b.review.status);
+    if (statusGap) return statusGap;
+    const severityGap = severityOrder[a.review.severity] - severityOrder[b.review.severity];
+    if (severityGap) return severityGap;
+    return a.order - b.order;
+  });
+  return sorted.map((row) => renderAcceptanceCard(row)).join("");
+}
+
+function renderAcceptanceCard(row: AcceptanceRow) {
+  const { review, present } = row;
+  const badge = review.status === "resolved"
+    ? `<sl-badge variant="success">${severityLabel(review.severity)} · 已解决</sl-badge>`
+    : review.status === "waived"
+      ? `<sl-badge variant="neutral">${severityLabel(review.severity)} · 已放行</sl-badge>`
+      : `<sl-badge variant="${review.severity === "error" ? "danger" : review.severity === "warning" ? "warning" : "primary"}">${severityLabel(review.severity)}</sl-badge>`;
+  const body = review.status === "pending"
+    ? renderPendingReview(review, present)
+    : renderClosedReview(review, present);
+  return `<article class="acceptance-card ${review.severity} ${review.status} ${present ? "" : "absent"}" data-issue-id="${review.issueId}">
+    <button class="acceptance-head" data-action="jump-issue" data-issue-id="${review.issueId}" data-block-id="${review.blockId}">
+      <span class="acceptance-badge">${badge}</span>
+      <b>${escapeHtml(review.title)}</b>
+      <small>${reviewMeta(review, present)}</small>
+    </button>
+    ${body}
+  </article>`;
+}
+
+function renderPendingReview(review: IssueReview, present: boolean) {
+  const isError = review.severity === "error";
+  const hint = isError
+    ? present
+      ? "必须修复项：请改正正文后再标记解决；问题未消除前不能放行。"
+      : "问题已不再检出。请处理人核对修复结果，填写处理说明后标记解决。"
+    : present
+      ? "建议项：完成优化后标记解决；如确认不修改，请写明放行理由。"
+      : "问题已不再检出。请处理人核对并填写说明后标记解决。";
+  const previous = review.previousOutcome;
+  return `<div class="acceptance-body">
+    ${previous ? `<p class="stale-note">⚠ 正文/术语/标题改动后，此前${previous.status === "resolved" ? "“已解决”" : "“已放行”"}结论已失效（${escapeHtml(previous.assignee || "未指派")}：${escapeHtml(previous.note || "无说明")}），请重新验收。</p>` : ""}
+    <p class="acceptance-hint">${hint}</p>
+    <div class="review-field">
+      <label for="assignee-${review.issueId}">处理人</label>
+      <sl-input size="small" id="assignee-${review.issueId}" data-review-field="assignee" data-issue-id="${review.issueId}" value="${escapeHtml(review.assignee)}" placeholder="指派给…（如：李编辑）" clearable></sl-input>
+    </div>
+    <div class="review-field">
+      <label for="note-${review.issueId}">处理说明${isError ? "（解决必填）" : "（解决或放行都必填）"}</label>
+      <sl-textarea size="small" id="note-${review.issueId}" data-review-field="note" data-issue-id="${review.issueId}" rows="2" value="${escapeHtml(review.note)}" placeholder="${isError ? "说明修复方式与核对结果" : "放行时必须写明理由，例如教材原文必须保留该术语并已在批注中解释"}"></sl-textarea>
+    </div>
+    <div class="review-buttons">
+      <sl-button size="small" variant="success" data-action="resolve-issue" data-issue-id="${review.issueId}">标记解决</sl-button>
+      ${!isError ? `<sl-button size="small" variant="warning" outline data-action="waive-issue" data-issue-id="${review.issueId}">带理由放行</sl-button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderClosedReview(review: IssueReview, present: boolean) {
+  const label = review.status === "resolved" ? "✓ 已解决" : "↷ 已放行（附理由）";
+  return `<div class="acceptance-body closed">
+    <div class="signoff-line"><b>${label}</b><span>${escapeHtml(review.assignee || "未指派")} · ${review.signedAt ? new Date(review.signedAt).toLocaleString() : ""}</span></div>
+    <p class="signoff-note">${escapeHtml(review.note)}</p>
+    ${!present ? `<small class="closed-hint">当前检查未再检出该问题。</small>` : ""}
+    <sl-button size="small" variant="default" outline data-action="reopen-issue" data-issue-id="${review.issueId}">重新待处理</sl-button>
+  </div>`;
+}
+
+function renderExportBlockers(blockers: ExportBlocker[] | null) {
+  if (!blockers) return "";
+  const errors = blockers.filter((item) => item.review.severity === "error");
+  const suggestions = blockers.filter((item) => item.review.severity !== "error");
+  const group = (items: ExportBlocker[]) => items.map((item) => {
+    const fixedHint = !item.present ? "（内容已修改，请核对后填说明并标记解决）" : "";
+    const location = item.blockIndex >= 0 ? `块 ${item.blockIndex + 1}` : "内容块已不在正文";
+    return `<li><b>${escapeHtml(item.review.title)}</b>${fixedHint}<small>${location} · 处理人：${escapeHtml(item.review.assignee || "未指派")}</small></li>`;
+  }).join("");
+  return `<div class="blocker-dialog">
+    <p class="blocker-intro">导出已被拦住：所有验收项必须有结论。必须修复项要标记解决；建议项要标记解决或写明理由放行。</p>
+    ${errors.length ? `<div class="blocker-group"><h3><sl-badge variant="danger">${errors.length} 项必须修复</sl-badge></h3><ul>${group(errors)}</ul></div>` : ""}
+    ${suggestions.length ? `<div class="blocker-group"><h3><sl-badge variant="warning">${suggestions.length} 项建议/提醒待定论</sl-badge></h3><ul>${group(suggestions)}</ul></div>` : ""}
+  </div>`;
+}
+
 function wireLiveFields() {
   app.querySelectorAll<HTMLElement>("sl-input[data-field], sl-textarea[data-field], sl-select[data-field]").forEach((element) => {
     element.addEventListener("sl-input", () => {
@@ -672,6 +970,77 @@ function wireLiveFields() {
   });
 }
 
+function reviewFieldValue(issueId: string, field: "assignee" | "note") {
+  const element = app.querySelector<HTMLElement & { value: string }>(`#${field}-${CSS.escape(issueId)}`);
+  if (element) return (element.value ?? "").trim();
+  // 卡片尚未重绘（例如输入事件不触发重绘时刚产生的新验收项），回退到已暂存的数据。
+  const review = project.issueReviews.find((item) => item.issueId === issueId);
+  return review?.[field]?.trim() ?? "";
+}
+
+function clearReviewError(issueId: string) {
+  app.querySelector(`[data-issue-id="${CSS.escape(issueId)}"] .review-error`)?.remove();
+}
+
+function showReviewError(issueId: string, message: string) {
+  let card = app.querySelector<HTMLElement>(`[data-issue-id="${CSS.escape(issueId)}"] .acceptance-body`);
+  if (!card) {
+    // 卡片还没渲染出来（如新检出的验收项）：先渲染再查找。
+    render();
+    card = app.querySelector(`[data-issue-id="${CSS.escape(issueId)}"] .acceptance-body`);
+  }
+  if (!card || card.querySelector(".review-error")) return;
+  const error = document.createElement("p");
+  error.className = "review-error";
+  error.textContent = message;
+  card.prepend(error);
+}
+
+function signIssue(issueId: string, outcome: "resolved" | "waived") {
+  const review = project.issueReviews.find((item) => item.issueId === issueId);
+  if (!review) return;
+  const note = reviewFieldValue(issueId, "note");
+  if (!note) {
+    showReviewError(issueId, outcome === "waived" ? "放行建议项必须写明理由。" : "标记解决前必须填写处理说明。");
+    return;
+  }
+  const liveIds = new Set(issues().map((issue) => issue.id));
+  if (outcome === "resolved" && liveIds.has(issueId)) {
+    showReviewError(issueId, "该问题在当前正文中仍然检出，请先完成修复。");
+    return;
+  }
+  if (outcome === "waived" && review.severity === "error") {
+    showReviewError(issueId, "必须修复项不能放行，请改正后标记解决。");
+    return;
+  }
+  const assignee = reviewFieldValue(issueId, "assignee");
+  commit(outcome === "resolved" ? "验收项标记解决" : "验收项带理由放行", (draft) => {
+    const target = draft.issueReviews.find((item) => item.issueId === issueId);
+    if (!target) return;
+    target.status = outcome;
+    target.note = note;
+    target.assignee = assignee;
+    target.signedAt = new Date().toISOString();
+    target.fingerprint = issueFingerprint(draft, issueId);
+    target.previousOutcome = undefined;
+  });
+}
+
+// mousedown 早于输入框失焦：点击“解决/放行”前先把尚未提交的最后一次键入写入项目，
+// 避免“填完说明直接点按钮”时读到旧值。
+app.addEventListener("mousedown", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLElement>("[data-action='resolve-issue'], [data-action='waive-issue']");
+  if (!button) return;
+  const issueId = button.dataset.issueId ?? "";
+  const noteEl = app.querySelector<HTMLElement & { value: string }>(`#note-${CSS.escape(issueId)}`);
+  const assigneeEl = app.querySelector<HTMLElement & { value: string }>(`#assignee-${CSS.escape(issueId)}`);
+  const review = project.issueReviews.find((item) => item.issueId === issueId);
+  if (review) {
+    if (noteEl) review.note = noteEl.value;
+    if (assigneeEl) review.assignee = assigneeEl.value;
+  }
+});
+
 app.addEventListener("click", (event) => {
   const target = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
   if (!target) return;
@@ -685,7 +1054,9 @@ app.addEventListener("click", (event) => {
   }
   if (action === "jump-issue") {
     activeIssueId = target.dataset.issueId ?? "";
-    activeBlockId = target.dataset.blockId ?? activeBlockId;
+    if (project.blocks.some((block) => block.id === target.dataset.blockId)) {
+      activeBlockId = target.dataset.blockId ?? activeBlockId;
+    }
     render();
     requestAnimationFrame(() => app.querySelector<HTMLElement>(".editor-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
@@ -749,15 +1120,59 @@ app.addEventListener("click", (event) => {
     selectedVersionId = versionId;
     render();
   }
-  if (action === "approve-all") {
-    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
+  if (action === "toggle-open-only") {
+    issueFilterOpenOnly = !issueFilterOpenOnly;
+    render();
+  }
+  if (action === "resolve-issue" || action === "waive-issue") {
+    const issueId = target.dataset.issueId ?? "";
+    signIssue(issueId, action === "resolve-issue" ? "resolved" : "waived");
+  }
+  if (action === "reopen-issue") {
+    const issueId = target.dataset.issueId ?? "";
+    commit("验收项重新待处理", (draft) => {
+      const review = draft.issueReviews.find((item) => item.issueId === issueId);
+      if (review) {
+        review.status = "pending";
+        review.signedAt = "";
+      }
+    });
+  }
+  if (action === "close-export-blockers") {
+    exportBlockers = null;
+    render();
   }
   if (action === "export") {
+    const liveIds = new Set(issues().map((issue) => issue.id));
+    const blockers = project.issueReviews
+      .filter((review) => review.status === "pending")
+      .map((review) => ({ review, present: liveIds.has(review.issueId), blockIndex: blockIndex(review.blockId) }));
+    if (blockers.length) {
+      exportBlockers = blockers;
+      issueFilterOpenOnly = true;
+      document.documentElement.dataset.lastAction = "导出被拦截：存在未处理验收项";
+      render();
+      return;
+    }
     download(`${project.title}-无障碍版.html`, exportHtml(project));
     document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
     render();
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
+});
+
+app.addEventListener("sl-input", (event) => {
+  const element = (event.target as HTMLElement).closest<HTMLElement & { value: string }>("[data-review-field]");
+  if (!element) return;
+  const issueId = element.dataset.issueId ?? "";
+  const field = element.dataset.reviewField;
+  commit("填写验收信息", (draft) => {
+    const review = draft.issueReviews.find((item) => item.issueId === issueId);
+    if (!review) return;
+    if (field === "assignee") review.assignee = element.value;
+    if (field === "note") review.note = element.value;
+  }, false);
+  clearReviewError(issueId);
 });
 
 app.addEventListener("sl-change", (event) => {
@@ -784,6 +1199,7 @@ app.addEventListener("change", (event) => {
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
       draft.blocks = parseImportedChapter(text);
+      draft.issueReviews = [];
       activeBlockId = draft.blocks[0]?.id ?? "";
       activeIssueId = "";
     });
@@ -796,6 +1212,12 @@ app.addEventListener("input", (event) => {
     project.title = input.value;
     saveSoon();
   }
+});
+
+app.addEventListener("sl-request-close", (event) => {
+  const element = event.target as HTMLElement;
+  if (element.matches('[data-dialog="glossary"]')) { showGlossary = false; render(); }
+  if (element.matches('[data-dialog="export-blockers"]')) { exportBlockers = null; render(); }
 });
 
 window.addEventListener("online", render);
@@ -817,12 +1239,17 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key.toLowerCase() === "j" || event.key.toLowerCase() === "k") {
-    const list = issues();
-    if (!list.length) return;
-    const current = Math.max(0, list.findIndex((issue) => issue.id === activeIssueId));
-    const next = (current + (event.key.toLowerCase() === "j" ? 1 : -1) + list.length) % list.length;
-    activeIssueId = list[next].id;
-    activeBlockId = list[next].blockId;
+    const live = issues();
+    const open = openReviews();
+    // 优先在待处理验收项间跳转；没有待处理项时遍历全部检查结果。
+    const navigable = open.length
+      ? open.map((review) => ({ id: review.issueId, blockId: review.blockId }))
+      : live.map((issue) => ({ id: issue.id, blockId: issue.blockId }));
+    if (!navigable.length) return;
+    const current = Math.max(0, navigable.findIndex((item) => item.id === activeIssueId));
+    const next = (current + (event.key.toLowerCase() === "j" ? 1 : -1) + navigable.length) % navigable.length;
+    activeIssueId = navigable[next].id;
+    activeBlockId = navigable[next].blockId;
     render();
   }
   if (event.key.toLowerCase() === "e") {
